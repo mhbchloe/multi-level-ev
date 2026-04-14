@@ -1,0 +1,3 @@
+# ignore processed csv outputs
+data_*_processed.csv
+*.csv
