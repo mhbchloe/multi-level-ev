@@ -77,7 +77,8 @@ def generate_vehicle_features(df_events):
             feat[f'event_cluster_{cluster_id}_ratio'] = event_cluster_dist.get(cluster_id, 0)
         
         # 主导事件簇
-        feat['dominant_event_cluster'] = vehicle_events['cluster'].mode()[0] if len(vehicle_events) > 0 else -1
+        mode_result = vehicle_events['cluster'].mode()
+        feat['dominant_event_cluster'] = mode_result.iloc[0] if len(mode_result) > 0 else -1
         
         # 事件簇多样性（Shannon熵）
         feat['event_cluster_diversity'] = entropy(event_cluster_dist.values)

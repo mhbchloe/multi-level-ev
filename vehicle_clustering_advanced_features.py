@@ -86,7 +86,8 @@ def generate_advanced_vehicle_features(df_events):
         mode_dist = vehicle_events['cluster'].value_counts(normalize=True)
         feat['mode_diversity'] = entropy(mode_dist)
         
-        feat['dominant_mode'] = vehicle_events['cluster'].mode()[0]
+        mode_result = vehicle_events['cluster'].mode()
+        feat['dominant_mode'] = mode_result.iloc[0] if len(mode_result) > 0 else 0
         feat['dominant_mode_ratio'] = (event_clusters == feat['dominant_mode']).mean()
         
         # ==================== B. 转移特征 (Transition) ====================
