@@ -23,7 +23,7 @@ print("=" * 80)
 print("\n【STEP 0】Loading raw data...")
 
 # 0.1 NPZ 聚类结果
-seg_result = np.load('./analysis_complete_vehicles/results/clustering_v3/clustering_v3_results.npz')
+seg_result = np.load('./anis_complete_vehicles/results/clustering_v3/clustering_v3_results.npz')
 labels = seg_result['labels']
 seg_types = seg_result['seg_types']
 
@@ -34,7 +34,7 @@ seg_phys = {k: seg_result[k] for k in phys_keys if k in seg_result}
 print(f"   ✓ NPZ: {len(labels):,} segments, 4 clusters")
 
 # 0.2 Segment 数据（已有聚类标签）
-seg_df = pd.read_csv('./coupling_analysis/results/segments_with_cluster_labels.csv')
+seg_df = pd.read_csv('./anis_complete_vehicles/results/segments_with_cluster_labels.csv')
 print(f"   ✓ Segment CSV: {len(seg_df):,} rows, {len(seg_df.columns)} columns")
 
 # 0.3 行程数据
