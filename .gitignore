@@ -1,3 +1,21 @@
 # ignore processed csv outputs
 data_*_processed.csv
 *.csv
+
+# --- python / editor ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+
+# --- autodl / conda env in repo dir (if any) ---
+.autodl/
+conda/
+
+# --- outputs / logs ---
+results/
+*.log
+
+# --- data (optional; enable if you have local datasets here) ---
+# data/
+# *.csv
