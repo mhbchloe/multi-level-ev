@@ -85,7 +85,7 @@ evolution_cols = [
 behavior_cols = ['high_energy_ratio', 'idle_dominant_ratio']
 phys_cols = [c for c in vehicle_features.columns if c.startswith('avg_')]
 
-feature_cols = distribution_cols + transition_cols + evolution_cols + behavior_cols + list(phys_cols)
+feature_cols = distribution_cols + transition_cols + evolution_cols + behavior_cols + phys_cols
 
 print(f"\n   Feature Selection (Three-Dimension Framework):")
 print(f"      ① Distribution: {len([f for f in distribution_cols if f in vehicle_features.columns])} features")
