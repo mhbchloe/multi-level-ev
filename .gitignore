@@ -33,3 +33,14 @@ results/
 **/*.pth
 **/*.pt
 **/*.ckpt
+
+# big data / artifacts
+*.geojson
+*.pth
+*.pt
+*.ckpt
+*.tfevents.*
+events.out.tfevents*
+runs/
+experiments/
+results/
