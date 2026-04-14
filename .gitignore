@@ -19,3 +19,17 @@ results/
 # --- data (optional; enable if you have local datasets here) ---
 # data/
 # *.csv
+
+# --- large geojson / trajectories ---
+*.geojson
+
+# --- tensorboard / training artifacts ---
+**/runs/
+**/experiments/
+**/*.tfevents.*
+**/events.out.tfevents*
+
+# --- model weights ---
+**/*.pth
+**/*.pt
+**/*.ckpt
