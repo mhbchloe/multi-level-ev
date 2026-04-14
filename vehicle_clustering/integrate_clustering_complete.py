@@ -3,11 +3,12 @@
 1. 为 segments 添加 trip_id
 2. 整合片段聚类标签
 3. 聚合到行程和车辆级别
-4. 生成车辆聚类的准备数据
+4. 生成车辆聚类的准备数据（三维特征体系：分布+转移+演化）
 """
 
 import numpy as np
 import pandas as pd
+from scipy.stats import entropy
 import os
 import json
 from datetime import datetime
@@ -200,9 +201,12 @@ trip_agg_df = pd.DataFrame(trip_features)
 print(f"   ✓ Aggregated {len(trip_agg_df):,} trips")
 
 # ============================================================
-# 4. 聚合到车辆级
+# 4. 聚合到车辆级（三维特征体系：分布+转移+演化）
 # ============================================================
-print(f"\n【STEP 4】Aggregating to vehicle level...")
+print(f"\n【STEP 4】Aggregating to vehicle level (Three-Dimension Framework)")
+print(f"   ① Distribution: cluster ratios + diversity entropy")
+print(f"   ② Transition: 4×4 matrix + switch rate + entropy + self-loop")
+print(f"   ③ Evolution: drift, trend, rhythm, stability")
 
 vehicle_features = []
 
@@ -218,27 +222,156 @@ for vehicle_id, v_group in tqdm(seg_df_final.groupby('vehicle_id'),
         'n_trips': n_trips,
     }
     
-    # 聚类组成（占比）
+    clusters = v_group['cluster_id'].values
+    
+    # ==================== ① 分布 (Distribution) ====================
+    # 四种模式各占多少比例
     cluster_dist = v_group['cluster_id'].value_counts(normalize=True).to_dict()
     for c in range(4):
         feat[f'cluster_{c}_ratio'] = cluster_dist.get(c, 0.0)
     
-    # 转移矩阵（简化版：只看占比）
-    clusters = v_group['cluster_id'].values
-    if len(clusters) > 1:
-        transitions = {}
-        for i in range(len(clusters) - 1):
-            from_c = clusters[i]
-            to_c = clusters[i + 1]
-            key = f'trans_{from_c}_to_{to_c}'
-            transitions[key] = transitions.get(key, 0) + 1
-        
-        for key, count in transitions.items():
-            feat[key] = count / (len(clusters) - 1)
+    # 模式多样性（Shannon 熵）
+    ratios = np.array([feat[f'cluster_{c}_ratio'] for c in range(4)])
+    ratios_nonzero = ratios[ratios > 0]
+    feat['mode_diversity'] = entropy(ratios_nonzero) if len(ratios_nonzero) > 0 else 0
     
+    # ==================== ② 转移 (Transition) ====================
+    # 4×4=16 转移概率矩阵
+    trans_matrix = np.zeros((4, 4))
+    if len(clusters) > 1:
+        for t in range(len(clusters) - 1):
+            from_c = int(clusters[t])
+            to_c = int(clusters[t + 1])
+            if 0 <= from_c < 4 and 0 <= to_c < 4:
+                trans_matrix[from_c, to_c] += 1
+    
+    # 行归一化得到转移概率
+    row_sums = trans_matrix.sum(axis=1, keepdims=True)
+    row_sums_safe = row_sums.copy()
+    row_sums_safe[row_sums_safe == 0] = 1
+    trans_prob = trans_matrix / row_sums_safe
+    
+    # 16 个转移概率特征
+    for i in range(4):
+        for j in range(4):
+            feat[f'trans_{i}_to_{j}'] = trans_prob[i, j]
+    
+    # 总体切换率
+    if len(clusters) > 1:
+        mode_switches = np.sum(clusters[:-1] != clusters[1:])
+        feat['mode_switch_rate'] = mode_switches / (len(clusters) - 1)
+    else:
+        feat['mode_switch_rate'] = 0
+    
+    # 转移熵（转移不确定性/多样性）
+    trans_entropies = []
+    for i in range(4):
+        if row_sums[i, 0] > 0:
+            trans_entropies.append(entropy(trans_prob[i]))
+    feat['transition_entropy'] = np.mean(trans_entropies) if trans_entropies else 0
+    
+    # 自环比例（停留在同一模式的概率）
+    n_active_modes = sum(1 for i in range(4) if row_sums[i, 0] > 0)
+    self_loop_sum = sum(trans_prob[i, i] for i in range(4) if row_sums[i, 0] > 0)
+    feat['self_loop_ratio'] = self_loop_sum / n_active_modes if n_active_modes > 0 else 0
+    
+    # ==================== ③ 演化 (Evolution) ====================
+    # --- 时序累积 (Temporal Accumulation) ---
+    # 前半段 vs 后半段的模式分布漂移
+    half = n_segs // 2
+    if half > 0:
+        first_half = clusters[:half]
+        second_half = clusters[half:]
+        dist_first = np.array([(first_half == c).mean() for c in range(4)])
+        dist_second = np.array([(second_half == c).mean() for c in range(4)])
+        feat['mode_drift'] = np.sum(np.abs(dist_first - dist_second))
+    else:
+        feat['mode_drift'] = 0
+    
+    # SOC 使用趋势（时间序列斜率）
+    soc_drops = v_group['soc_start'].values - v_group['soc_end'].values
+    if n_segs >= 3:
+        x_norm = np.arange(n_segs, dtype=float)
+        x_norm = x_norm - x_norm.mean()
+        denom = np.sum(x_norm ** 2)
+        feat['soc_trend'] = np.sum(x_norm * soc_drops) / denom if denom > 0 else 0
+    else:
+        feat['soc_trend'] = 0
+    
+    # --- 节奏 (Rhythm) ---
+    # 模式序列自相关（lag-1）
+    if n_segs >= 3:
+        mode_seq = clusters.astype(float)
+        mode_mean = mode_seq.mean()
+        mode_var = np.var(mode_seq)
+        if mode_var > 0:
+            feat['mode_autocorr_lag1'] = (
+                np.sum((mode_seq[:-1] - mode_mean) * (mode_seq[1:] - mode_mean))
+                / ((n_segs - 1) * mode_var)
+            )
+        else:
+            feat['mode_autocorr_lag1'] = 0
+    else:
+        feat['mode_autocorr_lag1'] = 0
+    
+    # 时间间隔规律性
+    if 'start_dt' in v_group.columns:
+        time_diffs = v_group['start_dt'].diff().dt.total_seconds().dropna() / 3600
+        if len(time_diffs) > 1:
+            feat['interval_regularity'] = 1 / (time_diffs.std() + 1)
+            td_mean = time_diffs.mean()
+            feat['interval_cv'] = time_diffs.std() / td_mean if td_mean > 0 else 0
+        else:
+            feat['interval_regularity'] = 0
+            feat['interval_cv'] = 0
+        
+        # 时间集中度
+        if 'start_dt' in v_group.columns:
+            hours = v_group['start_dt'].dt.hour.values
+            hour_dist = pd.Series(hours).value_counts(normalize=True)
+            feat['temporal_concentration'] = entropy(hour_dist)
+        else:
+            feat['temporal_concentration'] = 0
+    else:
+        feat['interval_regularity'] = 0
+        feat['interval_cv'] = 0
+        feat['temporal_concentration'] = 0
+    
+    # --- 稳定性 (Stability) ---
+    # 分窗口模式熵的标准差
+    window_size = max(n_segs // 3, 2)
+    if n_segs >= 6:
+        window_entropies = []
+        for w_start in range(0, n_segs - window_size + 1, window_size):
+            w_end = min(w_start + window_size, n_segs)
+            w_clusters = clusters[w_start:w_end]
+            w_dist = np.array([(w_clusters == c).mean() for c in range(4)])
+            w_dist = w_dist[w_dist > 0]
+            if len(w_dist) > 0:
+                window_entropies.append(entropy(w_dist))
+        feat['mode_entropy_stability'] = np.std(window_entropies) if len(window_entropies) > 1 else 0
+    else:
+        feat['mode_entropy_stability'] = 0
+    
+    # 平均连续相同模式长度
+    if n_segs > 1:
+        run_lengths = []
+        current_run = 1
+        for t in range(1, n_segs):
+            if clusters[t] == clusters[t - 1]:
+                current_run += 1
+            else:
+                run_lengths.append(current_run)
+                current_run = 1
+        run_lengths.append(current_run)
+        feat['avg_run_length'] = np.mean(run_lengths)
+    else:
+        feat['avg_run_length'] = 1
+    
+    # ==================== 辅助特征 ====================
     # 驾驶行为指标
-    feat['high_energy_ratio'] = (v_group['cluster_id'].isin([2, 3])).sum() / n_segs  # Highway + Mixed
-    feat['idle_dominant_ratio'] = (v_group['cluster_id'] == 0).sum() / n_segs  # Long Idle
+    feat['high_energy_ratio'] = (v_group['cluster_id'].isin([2, 3])).sum() / n_segs
+    feat['idle_dominant_ratio'] = (v_group['cluster_id'] == 0).sum() / n_segs
     
     # 物理特征均值
     for pk in phys_keys:
@@ -247,7 +380,6 @@ for vehicle_id, v_group in tqdm(seg_df_final.groupby('vehicle_id'),
             feat[f'avg_{pk}'] = v_group[col].mean()
     
     # SOC 和能耗
-    soc_drops = v_group['soc_start'].values - v_group['soc_end'].values
     feat['avg_soc_drop_per_segment'] = soc_drops.mean()
     feat['total_duration_hrs'] = v_group['duration_seconds'].sum() / 3600.0
     

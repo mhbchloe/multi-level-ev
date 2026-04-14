@@ -63,18 +63,43 @@ print(f"   ✓ Segments: {len(segments_df):,} segments")
 print(f"\n【STEP 2】Preparing Clustering Features")
 print("=" * 80)
 
-# 选择用于聚类的特征
+# 选择用于聚类的特征（三维特征体系）
+# ① 分布 (Distribution)
 cluster_ratio_cols = [f'cluster_{c}_ratio' for c in range(4)]
+distribution_cols = cluster_ratio_cols + ['mode_diversity']
+
+# ② 转移 (Transition)
+transition_cols = [f'trans_{i}_to_{j}' for i in range(4) for j in range(4)]
+transition_cols += ['mode_switch_rate', 'transition_entropy', 'self_loop_ratio']
+
+# ③ 演化 (Evolution)
+evolution_cols = [
+    'mode_drift', 'soc_trend',                    # 时序累积
+    'mode_autocorr_lag1',                          # 节奏
+    'interval_regularity', 'interval_cv',
+    'temporal_concentration',
+    'mode_entropy_stability', 'avg_run_length',    # 稳定性
+]
+
+# 辅助特征
 behavior_cols = ['high_energy_ratio', 'idle_dominant_ratio']
 phys_cols = [c for c in vehicle_features.columns if c.startswith('avg_')]
 
-feature_cols = cluster_ratio_cols + behavior_cols + phys_cols
+feature_cols = distribution_cols + transition_cols + evolution_cols + behavior_cols + phys_cols
 
-print(f"\n   Feature Selection:")
-print(f"      Cluster composition: {len(cluster_ratio_cols)} features")
-print(f"      Driving behavior: {len(behavior_cols)} features")
-print(f"      Physical features: {len(phys_cols)} features")
-print(f"      Total: {len(feature_cols)} features")
+print(f"\n   Feature Selection (Three-Dimension Framework):")
+print(f"      ① Distribution: {len([f for f in distribution_cols if f in vehicle_features.columns])} features")
+print(f"      ② Transition:   {len([f for f in transition_cols if f in vehicle_features.columns])} features")
+print(f"      ③ Evolution:    {len([f for f in evolution_cols if f in vehicle_features.columns])} features")
+print(f"      Behavior:       {len([f for f in behavior_cols if f in vehicle_features.columns])} features")
+print(f"      Physical:       {len([f for f in phys_cols if f in vehicle_features.columns])} features")
+
+# 只使用数据中实际存在的特征
+feature_cols = [f for f in feature_cols if f in vehicle_features.columns]
+missing_cols = set(distribution_cols + transition_cols + evolution_cols) - set(feature_cols)
+if missing_cols:
+    print(f"\n   ⚠️  Missing features (run integrate_clustering_complete.py first): {missing_cols}")
+print(f"      Total available: {len(feature_cols)} features")
 
 # 提取特征矩阵
 X = vehicle_features[feature_cols].copy()

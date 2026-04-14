@@ -73,104 +73,179 @@ def generate_advanced_vehicle_features(df_events):
         
         feat = {'vehicle_id': vehicle_id}
         
-        # ==================== A. 状态极值特征 ====================
-        
-        # SOC边界
-        feat['soc_start_mean'] = vehicle_events['soc_start'].mean()
-        feat['soc_start_std'] = vehicle_events['soc_start'].std()
-        feat['soc_end_mean'] = vehicle_events['soc_end'].mean()
-        feat['soc_end_std'] = vehicle_events['soc_end'].std()
-        feat['soc_end_min'] = vehicle_events['soc_end'].min()  # 续航焦虑边界
-        
-        # 续航焦虑指标
-        feat['range_anxiety_threshold'] = feat['soc_end_min']
-        feat['comfort_soc_buffer'] = feat['soc_start_mean'] - feat['soc_end_mean']
-        feat['soc_usage_range'] = vehicle_events['soc_start'].max() - feat['soc_end_min']
-        
-        # 低SOC事件
-        feat['critical_soc_events'] = (vehicle_events['soc_end'] < 20).sum()
-        feat['critical_soc_ratio'] = feat['critical_soc_events'] / len(vehicle_events)
-        
-        # 充电触发SOC
-        feat['charging_trigger_soc'] = np.percentile(vehicle_events['soc_end'], 25)
-        
-        # ==================== B. 转移特征 ====================
-        
-        # 驾驶模式切换
         event_clusters = vehicle_events['cluster'].values
-        mode_switches = np.sum(event_clusters[:-1] != event_clusters[1:])
-        feat['mode_switch_count'] = mode_switches
-        feat['mode_switch_rate'] = mode_switches / (len(vehicle_events) - 1)
+        n_events = len(vehicle_events)
         
-        # 模式多样性
+        # ==================== A. 分布特征 (Distribution) ====================
+        # 四种模式各占多少比例
+        
+        for cluster_id in range(4):
+            feat[f'event_cluster_{cluster_id}_ratio'] = (event_clusters == cluster_id).mean()
+        
+        # 模式多样性（Shannon熵）
         mode_dist = vehicle_events['cluster'].value_counts(normalize=True)
         feat['mode_diversity'] = entropy(mode_dist)
-        feat['mode_stability'] = -entropy(mode_dist)
         
-        feat['dominant_mode'] = vehicle_events['cluster'].mode()[0]
-        feat['dominant_mode_ratio'] = (vehicle_events['cluster'] == feat['dominant_mode']).mean()
+        mode_result = vehicle_events['cluster'].mode()
+        feat['dominant_mode'] = mode_result.iloc[0] if len(mode_result) > 0 else 0
+        feat['dominant_mode_ratio'] = (event_clusters == feat['dominant_mode']).mean()
         
-        # 速度模式切换（激进 vs 节能）
-        aggressive_mask = (vehicle_events['speed_mean'] > 50) | (vehicle_events['harsh_accel_count'] > 0)
-        aggressive_switches = np.sum(aggressive_mask.values[:-1] != aggressive_mask.values[1:])
-        feat['aggressive_switch_count'] = aggressive_switches
-        feat['aggressive_switch_rate'] = aggressive_switches / (len(vehicle_events) - 1)
+        # ==================== B. 转移特征 (Transition) ====================
+        # 4×4=16 转移概率矩阵：模式之间如何转换
         
-        # 切换方向不对称性
-        if aggressive_switches > 0:
-            eco_to_agg = np.sum((~aggressive_mask.values[:-1]) & (aggressive_mask.values[1:]))
-            agg_to_eco = np.sum((aggressive_mask.values[:-1]) & (~aggressive_mask.values[1:]))
-            feat['mode_switch_asymmetry'] = (eco_to_agg - agg_to_eco) / aggressive_switches
+        # 构建4×4转移计数矩阵
+        trans_matrix = np.zeros((4, 4))
+        for t in range(len(event_clusters) - 1):
+            from_mode = int(event_clusters[t])
+            to_mode = int(event_clusters[t + 1])
+            if 0 <= from_mode < 4 and 0 <= to_mode < 4:
+                trans_matrix[from_mode, to_mode] += 1
+        
+        # 行归一化得到转移概率
+        row_sums = trans_matrix.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1  # 避免除零
+        trans_prob = trans_matrix / row_sums
+        
+        # 提取16个转移概率特征
+        for i in range(4):
+            for j in range(4):
+                feat[f'trans_{i}_to_{j}'] = trans_prob[i, j]
+        
+        # 总体切换率
+        mode_switches = np.sum(event_clusters[:-1] != event_clusters[1:])
+        feat['mode_switch_rate'] = mode_switches / (n_events - 1)
+        
+        # 转移矩阵熵（转移的不确定性/多样性）
+        trans_entropies = []
+        for i in range(4):
+            if row_sums[i, 0] > 0:
+                trans_entropies.append(entropy(trans_prob[i]))
+        feat['transition_entropy'] = np.mean(trans_entropies) if trans_entropies else 0
+        
+        # 自环比例（停留在同一模式的概率）
+        self_loop_sum = sum(trans_prob[i, i] for i in range(4) if row_sums[i, 0] > 0)
+        n_active_modes = sum(1 for i in range(4) if row_sums[i, 0] > 0)
+        feat['self_loop_ratio'] = self_loop_sum / n_active_modes if n_active_modes > 0 else 0
+        
+        # ==================== C. 演化特征 (Evolution) ====================
+        # 时序累积、节奏、稳定性
+        
+        # --- C1. 时序累积 (Temporal Accumulation) ---
+        # 前半段 vs 后半段的模式分布漂移
+        half = n_events // 2
+        if half > 0:
+            first_half = event_clusters[:half]
+            second_half = event_clusters[half:]
+            dist_first = np.array([(first_half == c).mean() for c in range(4)])
+            dist_second = np.array([(second_half == c).mean() for c in range(4)])
+            # L1距离衡量模式分布漂移
+            feat['mode_drift'] = np.sum(np.abs(dist_first - dist_second))
         else:
-            feat['mode_switch_asymmetry'] = 0
+            feat['mode_drift'] = 0
         
-        # ==================== C. 时间偏好特征 ====================
+        # SOC使用趋势（时间序列斜率）
+        if n_events >= 3:
+            soc_drops = vehicle_events['soc_start'].values - vehicle_events['soc_end'].values
+            x_norm = np.arange(n_events, dtype=float)
+            x_norm = (x_norm - x_norm.mean())
+            denom = np.sum(x_norm ** 2)
+            if denom > 0:
+                feat['soc_trend'] = np.sum(x_norm * soc_drops) / denom
+            else:
+                feat['soc_trend'] = 0
+        else:
+            feat['soc_trend'] = 0
         
-        hours = vehicle_events['hour'].values
+        # --- C2. 节奏 (Rhythm) ---
+        # 模式序列自相关（lag-1）
+        if n_events >= 3:
+            mode_seq = event_clusters.astype(float)
+            mode_mean = mode_seq.mean()
+            mode_var = np.var(mode_seq)
+            if mode_var > 0:
+                autocorr = np.sum((mode_seq[:-1] - mode_mean) * (mode_seq[1:] - mode_mean)) / ((n_events - 1) * mode_var)
+                feat['mode_autocorr_lag1'] = autocorr
+            else:
+                feat['mode_autocorr_lag1'] = 0
+        else:
+            feat['mode_autocorr_lag1'] = 0
+        
+        # 时间间隔规律性
+        time_diffs = vehicle_events['start_datetime'].diff().dt.total_seconds().dropna() / 3600
+        if len(time_diffs) > 1:
+            feat['avg_interval_hours'] = time_diffs.mean()
+            feat['interval_regularity'] = 1 / (time_diffs.std() + 1)
+            td_mean = time_diffs.mean()
+            feat['interval_cv'] = time_diffs.std() / td_mean if td_mean > 0 else 0
+        else:
+            feat['avg_interval_hours'] = 0
+            feat['interval_regularity'] = 0
+            feat['interval_cv'] = 0
         
         # 时段分布
+        hours = vehicle_events['hour'].values
         feat['night_driving_ratio'] = np.mean((hours >= 22) | (hours < 6))
         feat['morning_peak_ratio'] = np.mean((hours >= 7) & (hours < 9))
         feat['evening_peak_ratio'] = np.mean((hours >= 17) & (hours < 19))
         feat['daytime_ratio'] = np.mean((hours >= 9) & (hours < 17))
-        
-        # 周末
         feat['weekend_ratio'] = vehicle_events['is_weekend'].mean()
         
         # 时间集中度
         hour_dist = pd.Series(hours).value_counts(normalize=True)
-        feat['temporal_concentration'] = -entropy(hour_dist)
+        feat['temporal_concentration'] = entropy(hour_dist)
         
-        feat['peak_activity_hour'] = hours.mean()
-        feat['activity_hour_std'] = hours.std()
-        
-        # 时间规律性（相邻事件间隔）
-        time_diffs = vehicle_events['start_datetime'].diff().dt.total_seconds().dropna() / 3600  # 小时
-        if len(time_diffs) > 0:
-            feat['avg_interval_hours'] = time_diffs.mean()
-            feat['interval_regularity'] = 1 / (time_diffs.std() + 1)
+        # --- C3. 稳定性 (Stability) ---
+        # 将事件序列分成若干窗口，计算各窗口模式分布熵的标准差
+        window_size = max(n_events // 3, 2)
+        if n_events >= 6:
+            window_entropies = []
+            for w_start in range(0, n_events - window_size + 1, window_size):
+                w_end = min(w_start + window_size, n_events)
+                w_clusters = event_clusters[w_start:w_end]
+                w_dist = np.array([(w_clusters == c).mean() for c in range(4)])
+                w_dist = w_dist[w_dist > 0]
+                if len(w_dist) > 0:
+                    window_entropies.append(entropy(w_dist))
+            if len(window_entropies) > 1:
+                feat['mode_entropy_stability'] = np.std(window_entropies)
+            else:
+                feat['mode_entropy_stability'] = 0
         else:
-            feat['avg_interval_hours'] = 0
-            feat['interval_regularity'] = 0
+            feat['mode_entropy_stability'] = 0
         
-        # ==================== D. 基础统计特征 ====================
+        # 主导模式持续长度（平均连续相同模式的run长度）
+        run_lengths = []
+        current_run = 1
+        for t in range(1, n_events):
+            if event_clusters[t] == event_clusters[t - 1]:
+                current_run += 1
+            else:
+                run_lengths.append(current_run)
+                current_run = 1
+        run_lengths.append(current_run)
+        feat['avg_run_length'] = np.mean(run_lengths)
+        feat['max_run_length'] = np.max(run_lengths)
         
-        feat['total_events'] = len(vehicle_events)
-        feat['total_duration_hours'] = vehicle_events['duration_seconds'].sum() / 3600
+        # ==================== D. 辅助特征 ====================
+        
+        # SOC边界
+        feat['soc_start_mean'] = vehicle_events['soc_start'].mean()
+        feat['soc_end_mean'] = vehicle_events['soc_end'].mean()
+        feat['soc_end_min'] = vehicle_events['soc_end'].min()
+        feat['range_anxiety_threshold'] = feat['soc_end_min']
+        feat['comfort_soc_buffer'] = feat['soc_start_mean'] - feat['soc_end_mean']
+        feat['critical_soc_ratio'] = (vehicle_events['soc_end'] < 20).mean()
+        feat['charging_trigger_soc'] = np.percentile(vehicle_events['soc_end'], 25)
+        
+        # 驾驶行为
+        feat['total_events'] = n_events
         feat['total_distance_km'] = vehicle_events['distance_km'].sum()
         feat['total_energy_kwh'] = vehicle_events['energy_consumption_kwh'].sum()
-        
         feat['speed_mean'] = vehicle_events['speed_mean'].mean()
-        feat['speed_std'] = vehicle_events['speed_mean'].std()
         feat['idle_ratio_mean'] = vehicle_events['idle_ratio'].mean()
         feat['accel_abs_mean'] = vehicle_events['accel_abs_mean'].mean()
-        
         feat['power_mean'] = vehicle_events['power_mean'].mean()
         feat['efficiency_kwh_per_km'] = vehicle_events['efficiency_kwh_per_km'].mean()
-        
-        # 事件簇分布
-        for cluster_id in range(4):
-            feat[f'event_cluster_{cluster_id}_ratio'] = (vehicle_events['cluster'] == cluster_id).mean()
         
         vehicle_features.append(feat)
     
@@ -188,46 +263,49 @@ def prepare_features(df_vehicles):
     print("="*70)
     
     feature_groups = {
-        '续航焦虑': [
-            'range_anxiety_threshold',
-            'charging_trigger_soc',
-            'critical_soc_ratio',
-            'comfort_soc_buffer',
-        ],
-        '模式切换': [
-            'mode_switch_rate',
-            'mode_diversity',
-            'aggressive_switch_rate',
-            'mode_switch_asymmetry',
-        ],
-        '时间偏好': [
-            'night_driving_ratio',
-            'morning_peak_ratio',
-            'evening_peak_ratio',
-            'weekend_ratio',
-            'temporal_concentration',
-            'interval_regularity',
-        ],
-        '驾驶行为': [
-            'speed_mean',
-            'idle_ratio_mean',
-            'accel_abs_mean',
-        ],
-        '能量使用': [
-            'power_mean',
-            'efficiency_kwh_per_km',
-            'total_energy_kwh',
-        ],
-        '使用强度': [
-            'total_events',
-            'total_distance_km',
-        ],
-        '事件簇分布': [
+        # ① 分布：四种模式各占多少比例
+        '分布_Distribution': [
             'event_cluster_0_ratio',
             'event_cluster_1_ratio',
             'event_cluster_2_ratio',
             'event_cluster_3_ratio',
-        ]
+            'mode_diversity',
+        ],
+        # ② 转移：4×4=16 转移概率 + 汇总指标
+        '转移_Transition': [
+            'trans_0_to_0', 'trans_0_to_1', 'trans_0_to_2', 'trans_0_to_3',
+            'trans_1_to_0', 'trans_1_to_1', 'trans_1_to_2', 'trans_1_to_3',
+            'trans_2_to_0', 'trans_2_to_1', 'trans_2_to_2', 'trans_2_to_3',
+            'trans_3_to_0', 'trans_3_to_1', 'trans_3_to_2', 'trans_3_to_3',
+            'mode_switch_rate',
+            'transition_entropy',
+            'self_loop_ratio',
+        ],
+        # ③ 演化：时序累积、节奏、稳定性
+        '演化_Evolution': [
+            # 时序累积
+            'mode_drift',
+            'soc_trend',
+            # 节奏
+            'mode_autocorr_lag1',
+            'interval_regularity',
+            'interval_cv',
+            'temporal_concentration',
+            # 稳定性
+            'mode_entropy_stability',
+            'avg_run_length',
+        ],
+        # 辅助特征
+        '辅助_Auxiliary': [
+            'range_anxiety_threshold',
+            'charging_trigger_soc',
+            'critical_soc_ratio',
+            'comfort_soc_buffer',
+            'speed_mean',
+            'idle_ratio_mean',
+            'power_mean',
+            'efficiency_kwh_per_km',
+        ],
     }
     
     all_features = []
