@@ -49,6 +49,12 @@ from sklearn.feature_selection import RFE
 from sklearn.ensemble import RandomForestClassifier
 from tqdm import tqdm
 
+try:
+    import hdbscan as _hdbscan_module
+    HAS_HDBSCAN = True
+except ImportError:
+    HAS_HDBSCAN = False
+
 warnings.filterwarnings('ignore')
 
 plt.rcParams['font.family'] = 'sans-serif'
@@ -89,6 +95,9 @@ os.makedirs(CONFIG['save_dir'], exist_ok=True)
 os.makedirs(CONFIG['fig_dir'], exist_ok=True)
 
 np.random.seed(CONFIG['seed'])
+
+# Number of segment-level clusters (C0-C3)
+N_SEG_CLUSTERS = 4
 
 print("=" * 80)
 print("STEP 12: FEATURE DIAGNOSIS AND OPTIMIZATION ANALYSIS")
@@ -269,9 +278,9 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
     feat = {'vehicle_id': vehicle_id}
 
     # --- Distribution features (from cluster ratios) ---
-    cluster_counts = np.bincount(clusters, minlength=4)
+    cluster_counts = np.bincount(clusters, minlength=N_SEG_CLUSTERS)
     cluster_ratios = cluster_counts / max(n_segs, 1)
-    for c in range(4):
+    for c in range(N_SEG_CLUSTERS):
         feat[f'cluster_{c}_ratio'] = cluster_ratios[c]
 
     # Distribution entropy
@@ -282,7 +291,7 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
     feat['dominant_mode_ratio'] = float(cluster_ratios.max())
 
     # --- Transition matrix features (compact: 5-6 instead of 16) ---
-    T = np.zeros((4, 4))
+    T = np.zeros((N_SEG_CLUSTERS, N_SEG_CLUSTERS))
     if n_segs > 1:
         for i in range(n_segs - 1):
             T[clusters[i], clusters[i + 1]] += 1
@@ -291,7 +300,7 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
         row_sums[row_sums == 0] = 1
         T_norm = T_norm / row_sums
     else:
-        T_norm = np.eye(4) * 0.25
+        T_norm = np.eye(N_SEG_CLUSTERS) * (1.0 / N_SEG_CLUSTERS)
 
     # Highway preference: tendency to enter/leave highway mode (cluster 2)
     feat['highway_preference'] = float(
@@ -303,10 +312,10 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
     feat['idle_preference'] = float(
         (T_norm[0, :].sum() + T_norm[:, 0].sum()) / 2)
     # Mode stability: diagonal dominance
-    feat['mode_stability'] = float(np.trace(T_norm) / 4)
+    feat['mode_stability'] = float(np.trace(T_norm) / N_SEG_CLUSTERS)
     # Transition diversity: fraction of active transitions
     feat['transition_diversity'] = float(
-        len(np.where(T_norm > 0.01)[0]) / 16)
+        len(np.where(T_norm > 0.01)[0]) / T_norm.size)
     # Max transition probability
     feat['max_transition_prob'] = float(np.max(T_norm))
 
@@ -314,7 +323,7 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
     total_time = durations.sum()
     if total_time > 0:
         # Time proportions by mode
-        for c in range(4):
+        for c in range(N_SEG_CLUSTERS):
             mode_time = durations[clusters == c].sum()
             feat[f'time_proportion_C{c}'] = float(mode_time / total_time)
 
@@ -323,7 +332,7 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
         feat['idle_concentration'] = float(
             compute_gini_coefficient(idle_durations) if len(idle_durations) > 1 else 0.0)
     else:
-        for c in range(4):
+        for c in range(N_SEG_CLUSTERS):
             feat[f'time_proportion_C{c}'] = 0.0
         feat['idle_concentration'] = 0.0
 
@@ -380,10 +389,10 @@ for vehicle_id, v_group in tqdm(segments_df.groupby('vehicle_id'),
 
         # Long-term stability: similarity between first and second half
         mid = n_segs // 2
-        first_half = np.bincount(clusters[:mid], minlength=4) / max(mid, 1)
-        second_half = np.bincount(clusters[mid:], minlength=4) / max(n_segs - mid, 1)
+        first_half = np.bincount(clusters[:mid], minlength=N_SEG_CLUSTERS) / max(mid, 1)
+        second_half = np.bincount(clusters[mid:], minlength=N_SEG_CLUSTERS) / max(n_segs - mid, 1)
         feat['long_term_stability'] = float(
-            1.0 - np.sqrt(np.sum((first_half - second_half) ** 2) / 4))
+            1.0 - np.sqrt(np.sum((first_half - second_half) ** 2) / N_SEG_CLUSTERS))
     else:
         feat['mode_switching_freq'] = 0.0
         feat['rhythm_consistency'] = 0.0
@@ -630,36 +639,37 @@ for K in CONFIG['n_clusters_range']:
         print(f"      Spectral: Failed - {e}")
 
     # HDBSCAN
-    try:
-        import hdbscan
-        hdb = hdbscan.HDBSCAN(min_cluster_size=max(50, len(X_final_scaled) // 20),
-                              min_samples=10, cluster_selection_method='eom')
-        labels_hdb = hdb.fit_predict(X_final_scaled)
-        n_hdb_clusters = len(set(labels_hdb)) - (1 if -1 in labels_hdb else 0)
-        if n_hdb_clusters >= 2:
-            valid = labels_hdb != -1
-            sil_hdb = silhouette_score(X_final_scaled[valid], labels_hdb[valid],
-                                      sample_size=min(5000, valid.sum()),
-                                      random_state=CONFIG['seed'])
-            db_hdb = davies_bouldin_score(X_final_scaled[valid], labels_hdb[valid])
-            ch_hdb = calinski_harabasz_score(X_final_scaled[valid], labels_hdb[valid])
-            noise_pct = float((~valid).sum() / len(labels_hdb))
-            k_results['HDBSCAN'] = {
-                'silhouette': float(sil_hdb),
-                'davies_bouldin': float(db_hdb),
-                'calinski_harabasz': float(ch_hdb),
-                'n_clusters_found': n_hdb_clusters,
-                'noise_fraction': noise_pct,
-            }
-            print(f"      HDBSCAN:  Sil={sil_hdb:.4f}  DB={db_hdb:.4f}  "
-                  f"CH={ch_hdb:.1f}  K_found={n_hdb_clusters}  "
-                  f"noise={noise_pct:.1%}")
-        else:
-            print(f"      HDBSCAN:  Only {n_hdb_clusters} cluster(s) found")
-    except ImportError:
+    if HAS_HDBSCAN:
+        try:
+            hdb = _hdbscan_module.HDBSCAN(
+                min_cluster_size=max(50, len(X_final_scaled) // 20),
+                min_samples=10, cluster_selection_method='eom')
+            labels_hdb = hdb.fit_predict(X_final_scaled)
+            n_hdb_clusters = len(set(labels_hdb)) - (1 if -1 in labels_hdb else 0)
+            if n_hdb_clusters >= 2:
+                valid = labels_hdb != -1
+                sil_hdb = silhouette_score(X_final_scaled[valid], labels_hdb[valid],
+                                          sample_size=min(5000, valid.sum()),
+                                          random_state=CONFIG['seed'])
+                db_hdb = davies_bouldin_score(X_final_scaled[valid], labels_hdb[valid])
+                ch_hdb = calinski_harabasz_score(X_final_scaled[valid], labels_hdb[valid])
+                noise_pct = float((~valid).sum() / len(labels_hdb))
+                k_results['HDBSCAN'] = {
+                    'silhouette': float(sil_hdb),
+                    'davies_bouldin': float(db_hdb),
+                    'calinski_harabasz': float(ch_hdb),
+                    'n_clusters_found': n_hdb_clusters,
+                    'noise_fraction': noise_pct,
+                }
+                print(f"      HDBSCAN:  Sil={sil_hdb:.4f}  DB={db_hdb:.4f}  "
+                      f"CH={ch_hdb:.1f}  K_found={n_hdb_clusters}  "
+                      f"noise={noise_pct:.1%}")
+            else:
+                print(f"      HDBSCAN:  Only {n_hdb_clusters} cluster(s) found")
+        except Exception as e:
+            print(f"      HDBSCAN:  Failed - {e}")
+    else:
         print("      HDBSCAN:  Not installed, skipping")
-    except Exception as e:
-        print(f"      HDBSCAN:  Failed - {e}")
 
     algo_results[str(K)] = k_results
 
@@ -1085,7 +1095,8 @@ sns.heatmap(profile_norm, annot=True, fmt='.2f', cmap='YlOrRd',
             ax=ax, cbar_kws={'shrink': 0.8, 'label': 'Normalized'},
             annot_kws={'size': 7})
 ax.set_title('Cluster Profiles (Normalized)', fontweight='bold')
-ax.tick_params(axis='x', labelsize=7, rotation=45)
+ax.tick_params(axis='x', labelsize=7)
+plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
 
 plt.tight_layout()
 fig.savefig(os.path.join(CONFIG['fig_dir'], '08_cluster_characteristics.png'),
