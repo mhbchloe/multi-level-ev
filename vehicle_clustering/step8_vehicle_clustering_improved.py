@@ -3,9 +3,9 @@ Step 8 Improved: Vehicle-Level Clustering with 3D Feature Framework
 改进版车辆聚类：整合 分布(Distribution)、转移(Transition)、演化(Evolution) 三个维度
 
 三维特征框架:
-  ① 分布 (4 features): 四种驾驶模式(C0-C3)各占多少比例
-  ② 转移 (16+3 features): 4×4转移矩阵 + 转移熵 + 模式切换率 + 稳定性指数
-  ③ 演化 (~8 features): 时序特性：序列长度、切换频率、稳定性、累积时间、节奏规律性、模式熵
+  ① 分布 (5 features): 四种驾驶模式(C0-C3)各占多少比例 + 模式多样性(熵)
+  ② 转移 (19 features): 4×4转移矩阵(16) + 转移熵 + 模式切换率 + 自环比率(self_loop_ratio)
+  ③ 演化 (11 features): 序列长度、切换频率、稳定性、平均运行长度、节奏规律性、模式熵、主导模式占比 + 4种模式累积时间
 """
 
 import numpy as np
@@ -102,7 +102,7 @@ def compute_3d_features(vehicle_id, v_group, n_modes=4):
     feat = {'vehicle_id': vehicle_id}
 
     # ============================================================
-    # ① 分布维度 (Distribution): 4 features
+    # ① 分布维度 (Distribution): 5 features
     # ============================================================
     cluster_dist = pd.Series(clusters).value_counts(normalize=True).to_dict()
     for c in range(n_modes):
@@ -115,7 +115,7 @@ def compute_3d_features(vehicle_id, v_group, n_modes=4):
     feat['mode_diversity'] = float(sp_entropy(ratios_arr)) if len(ratios_arr) > 0 else 0.0
 
     # ============================================================
-    # ② 转移维度 (Transition): 16 + 3 features
+    # ② 转移维度 (Transition): 19 features (16 matrix + 3 summary)
     # ============================================================
     # 4×4 transition matrix (normalized)
     trans_matrix = np.zeros((n_modes, n_modes))
@@ -157,7 +157,7 @@ def compute_3d_features(vehicle_id, v_group, n_modes=4):
     feat['self_loop_ratio'] = self_loop_total / max(total_transitions, 1) if n_segs > 1 else 1.0
 
     # ============================================================
-    # ③ 演化维度 (Evolution): ~8-10 features
+    # ③ 演化维度 (Evolution): 11 features (7 temporal + 4 cumulative)
     # ============================================================
 
     # 3.1 Sequence length
