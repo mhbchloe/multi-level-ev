@@ -83,7 +83,8 @@ soc_cols = [c for c in vehicle_features.columns if c in [
     'avg_soc_drop_per_segment', 'max_soc_drop', 'soc_consumption_rate', 'total_duration_hrs'
 ]]
 
-# 注意：不使用 high_energy_ratio 和 idle_dominant_ratio (它们与 cluster ratios 线性冗余)
+# 注意：不使用 high_energy_ratio 和 idle_dominant_ratio 作为聚类输入特征
+# (它们与 cluster ratios 线性冗余，但在 Step 5 分析中仍从 cluster ratios 计算用于标记)
 feature_cols = cluster_ratio_cols + diversity_cols + trans_cols + phys_cols + soc_cols
 # 去重并保持顺序
 seen = set()
@@ -137,10 +138,10 @@ else:
 print(f"   ✓ Active features: {X_active.shape[1]}")
 
 # PCA 降维 (保留 95% 方差，减少噪声维度)
-pca_pre = PCA(n_components=0.95, random_state=CONFIG['seed'])
-X_cluster = pca_pre.fit_transform(X_active)
+pca_reduction = PCA(n_components=0.95, random_state=CONFIG['seed'])
+X_cluster = pca_reduction.fit_transform(X_active)
 n_pca_dims = X_cluster.shape[1]
-pca_var_retained = pca_pre.explained_variance_ratio_.sum()
+pca_var_retained = pca_reduction.explained_variance_ratio_.sum()
 print(f"   ✓ PCA: {X_active.shape[1]} → {n_pca_dims} dims (variance retained: {pca_var_retained:.2%})")
 
 # ============================================================
