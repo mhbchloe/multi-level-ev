@@ -393,7 +393,10 @@ Generated Files:
      - Original trips + cluster features
 
 Next Steps:
-  1. Use vehicles_aggregated_features.csv for vehicle clustering
-  2. Run: python vehicle_clustering/step8_vehicle_clustering_fixed.py
-  3. Update the config to use segments_integrated_complete.csv
+  1. Run vehicle clustering:
+     python vehicle_clustering/step8_vehicle_clustering.py
+  2. Run feature dimension analysis:
+     python vehicle_clustering/step9_feature_dimension_analysis.py
+  3. Run coupling analysis:
+     python coupling_analysis/step_3_3_coupling_analysis.py
 """)

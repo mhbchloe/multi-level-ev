@@ -418,9 +418,11 @@ Output Files:
   6. gmm_cluster_composition.png/pdf
 
 Next Steps:
-  - Use vehicle clusters for charging analysis
-  - Integrate with inter_charge_trips data
-  - Run coupling analysis (Step 3.3)
+  1. Run Step 9 feature analysis:
+     python vehicle_clustering/step9_feature_dimension_analysis.py
+  2. Generate paper figures:
+     python vehicle_clustering/step8_vehicle_clustering_analysis_figures.py
+  3. Run coupling analysis (Step 3.3)
 """)
 
 print("=" * 80)
