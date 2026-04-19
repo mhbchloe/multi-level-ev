@@ -1,1 +1,35 @@
-import matplotlib.pyplot as plt\nimport shap\nimport pandas as pd\nimport seaborn as sns\n\nclass EnhancedVisualization:\n    def __init__(self, model, X, y):\n        self.model = model\n        self.X = X\n        self.y = y\n        self.explainer = shap.Explainer(model)\n        self.shap_values = self.explainer(X)\n\n    def plot_shap_analysis(self):\n        shap.summary_plot(self.shap_values, self.X)\n\n    def plot_violin_plot(self):\n        plt.figure(figsize=(12, 6))\n        sns.violinplot(data=self.X)\n        plt.title('Violin Plot of Features')\n        plt.show()\n\n    def plot_waterfall(self):\n        for i in range(len(self.shap_values)):\n            plt.figure()\n            shap.waterfall_plot(self.shap_values[i])\n\n    def run_all_visualizations(self):\n        self.plot_shap_analysis()\n        self.plot_violin_plot()\n        self.plot_waterfall()\n\n# Example Usage:\n# if __name__ == '__main__':\n#     # Load your model and data here\n#     ev = EnhancedVisualization(model, X, y)\n#     ev.run_all_visualizations()\n
+"""
+Step 15: Discharge-Vehicle-Anxiety-Charging Causality Analysis
+==============================================================
+Entry-point shim — delegates to the full implementation.
+
+The comprehensive script lives at:
+    coupling_analysis/step15_discharge_anxiety_causality.py
+
+Key changes vs the prior stub:
+* SHAP visualization uses a custom bar chart of mean |SHAP| values instead of
+  shap.summary_plot(), which caused rendering failures.
+* All labels and titles are in English (no Chinese characters).
+* Every visualization is wrapped in try/except so failures are reported and
+  skipped without stopping the rest of the run.
+* Missing data is handled gracefully with informative messages.
+
+Run the full analysis from the repository root:
+
+    python coupling_analysis/step15_discharge_anxiety_causality.py
+
+Outputs (15 figures + CSVs + TXT report) are written to:
+    ./coupling_analysis/results/figures_step15/
+"""
+
+import runpy
+import os
+
+_script = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "coupling_analysis",
+    "step15_discharge_anxiety_causality.py",
+)
+
+if __name__ == "__main__":
+    runpy.run_path(_script, run_name="__main__")
