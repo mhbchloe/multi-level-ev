@@ -12,6 +12,7 @@ import os
 import json
 from datetime import datetime
 from tqdm import tqdm
+from scipy.stats import entropy as scipy_entropy
 
 print("=" * 80)
 print("🔗 COMPLETE DATA INTEGRATION (Segments → Trips → Vehicles)")
@@ -218,37 +219,81 @@ for vehicle_id, v_group in tqdm(seg_df_final.groupby('vehicle_id'),
         'n_trips': n_trips,
     }
     
-    # 聚类组成（占比）
+    # ① 分布特征 (Distribution)
     cluster_dist = v_group['cluster_id'].value_counts(normalize=True).to_dict()
+    ratios = []
     for c in range(4):
-        feat[f'cluster_{c}_ratio'] = cluster_dist.get(c, 0.0)
+        r = cluster_dist.get(c, 0.0)
+        feat[f'cluster_{c}_ratio'] = r
+        ratios.append(r)
     
-    # 转移矩阵（简化版：只看占比）
+    # 模式多样性 (Shannon entropy of cluster distribution)
+    ratios_arr = np.array(ratios)
+    ratios_pos = ratios_arr[ratios_arr > 0]
+    feat['mode_diversity'] = float(scipy_entropy(ratios_pos, base=2)) if len(ratios_pos) > 0 else 0.0
+    
+    # ② 转移特征 (Transition)
     clusters = v_group['cluster_id'].values
+    
+    # 完整 4×4 转移矩阵 (always 16 features, no sparsity)
+    trans_matrix = np.zeros((4, 4), dtype=np.float64)
     if len(clusters) > 1:
-        transitions = {}
         for i in range(len(clusters) - 1):
-            from_c = clusters[i]
-            to_c = clusters[i + 1]
-            key = f'trans_{from_c}_to_{to_c}'
-            transitions[key] = transitions.get(key, 0) + 1
-        
-        for key, count in transitions.items():
-            feat[key] = count / (len(clusters) - 1)
+            from_c = int(clusters[i])
+            to_c = int(clusters[i + 1])
+            trans_matrix[from_c, to_c] += 1
+        trans_total = trans_matrix.sum()
+        if trans_total > 0:
+            trans_matrix /= trans_total
     
-    # 驾驶行为指标
-    feat['high_energy_ratio'] = (v_group['cluster_id'].isin([2, 3])).sum() / n_segs  # Highway + Mixed
-    feat['idle_dominant_ratio'] = (v_group['cluster_id'] == 0).sum() / n_segs  # Long Idle
+    for fc in range(4):
+        for tc in range(4):
+            feat[f'trans_{fc}_to_{tc}'] = float(trans_matrix[fc, tc])
     
-    # 物理特征均值
+    # 模式切换率 (mode switch rate)
+    if len(clusters) > 1:
+        n_switches = sum(1 for i in range(len(clusters) - 1) if clusters[i] != clusters[i + 1])
+        feat['mode_switch_rate'] = n_switches / (len(clusters) - 1)
+    else:
+        feat['mode_switch_rate'] = 0.0
+    
+    # 转移熵 (transition entropy)
+    trans_flat = trans_matrix.flatten()
+    trans_pos = trans_flat[trans_flat > 0]
+    feat['transition_entropy'] = float(scipy_entropy(trans_pos, base=2)) if len(trans_pos) > 0 else 0.0
+    
+    # 自环比例 (self-loop ratio: staying in same mode)
+    self_loop = np.trace(trans_matrix)
+    feat['self_loop_ratio'] = float(self_loop)
+    
+    # ③ 演化特征 (Evolution)
+    # 平均连续运行长度 (average run length in same mode)
+    if len(clusters) > 1:
+        run_lengths = []
+        current_run = 1
+        for i in range(1, len(clusters)):
+            if clusters[i] == clusters[i - 1]:
+                current_run += 1
+            else:
+                run_lengths.append(current_run)
+                current_run = 1
+        run_lengths.append(current_run)
+        feat['avg_run_length'] = float(np.mean(run_lengths))
+    else:
+        feat['avg_run_length'] = float(n_segs)
+    
+    # 物理特征均值和标准差
     for pk in phys_keys:
         col = f'phys_{pk}'
         if col in v_group.columns:
             feat[f'avg_{pk}'] = v_group[col].mean()
+            feat[f'std_{pk}'] = v_group[col].std() if n_segs > 1 else 0.0
     
     # SOC 和能耗
     soc_drops = v_group['soc_start'].values - v_group['soc_end'].values
     feat['avg_soc_drop_per_segment'] = soc_drops.mean()
+    feat['max_soc_drop'] = soc_drops.max() if len(soc_drops) > 0 else 0.0
+    feat['soc_consumption_rate'] = soc_drops.sum() / max(v_group['duration_seconds'].sum() / 3600.0, 1e-6)
     feat['total_duration_hrs'] = v_group['duration_seconds'].sum() / 3600.0
     
     vehicle_features.append(feat)

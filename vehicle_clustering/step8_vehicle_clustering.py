@@ -1,6 +1,6 @@
 """
-Step 8: Vehicle-Level Clustering (GMM K=4)
-使用GMM，固定K=4，完成车辆级聚类
+Step 8: Vehicle-Level Clustering (GMM with automatic K selection)
+使用GMM，通过多指标综合选择最优K，完成车辆级聚类
 """
 
 import numpy as np
@@ -12,7 +12,7 @@ import warnings
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib import rcParams
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from sklearn.decomposition import PCA
@@ -27,7 +27,7 @@ rcParams['font.size'] = 11
 rcParams['figure.dpi'] = 150
 
 print("=" * 80)
-print("🚀 STEP 8: VEHICLE-LEVEL CLUSTERING (GMM K=4)")
+print("🚀 STEP 8: VEHICLE-LEVEL CLUSTERING (GMM)")
 print("=" * 80)
 
 # ============================================================
@@ -38,7 +38,7 @@ CONFIG = {
     'segments_path': './coupling_analysis/results/segments_integrated_complete.csv',
     'save_dir': './vehicle_clustering/results/',
     'seed': 42,
-    'n_clusters': 4,  # 固定 K=4
+    'k_range': range(2, 8),  # 自动搜索 K
 }
 
 os.makedirs(CONFIG['save_dir'], exist_ok=True)
@@ -63,42 +63,65 @@ print(f"   ✓ Segments: {len(segments_df):,} segments")
 print(f"\n【STEP 2】Preparing Clustering Features")
 print("=" * 80)
 
-# 选择用于聚类的特征
+# 选择用于聚类的特征 (去除冗余特征)
 cluster_ratio_cols = [f'cluster_{c}_ratio' for c in range(4)]
-behavior_cols = ['high_energy_ratio', 'idle_dominant_ratio']
-phys_cols = [c for c in vehicle_features.columns if c.startswith('avg_')]
 
-feature_cols = cluster_ratio_cols + behavior_cols + phys_cols
+# 新增的丰富特征
+diversity_cols = [c for c in vehicle_features.columns if c in [
+    'mode_diversity', 'mode_switch_rate', 'transition_entropy', 
+    'self_loop_ratio', 'avg_run_length'
+]]
+
+# 完整 4×4 转移矩阵特征
+trans_cols = [c for c in vehicle_features.columns if c.startswith('trans_')]
+
+# 物理特征（均值和标准差）
+phys_cols = [c for c in vehicle_features.columns if c.startswith('avg_') or c.startswith('std_')]
+
+# SOC/能耗特征
+soc_cols = [c for c in vehicle_features.columns if c in [
+    'avg_soc_drop_per_segment', 'max_soc_drop', 'soc_consumption_rate', 'total_duration_hrs'
+]]
+
+# 注意：不使用 high_energy_ratio 和 idle_dominant_ratio 作为聚类输入特征
+# (它们与 cluster ratios 线性冗余，但在 Step 5 分析中仍从 cluster ratios 计算用于标记)
+feature_cols = cluster_ratio_cols + diversity_cols + trans_cols + phys_cols + soc_cols
+# 去重并保持顺序
+seen = set()
+feature_cols = [c for c in feature_cols if c in vehicle_features.columns and not (c in seen or seen.add(c))]
 
 print(f"\n   Feature Selection:")
 print(f"      Cluster composition: {len(cluster_ratio_cols)} features")
-print(f"      Driving behavior: {len(behavior_cols)} features")
+print(f"      Diversity/dynamics: {len(diversity_cols)} features")
+print(f"      Transition matrix: {len(trans_cols)} features")
 print(f"      Physical features: {len(phys_cols)} features")
+print(f"      SOC/energy features: {len(soc_cols)} features")
 print(f"      Total: {len(feature_cols)} features")
 
 # 提取特征矩阵
 X = vehicle_features[feature_cols].copy()
 
-# 处理缺失值
+# 处理缺失值 (使用中位数填充代替0, 避免偏差)
 missing = X.isna().sum().sum()
 if missing > 0:
-    print(f"\n   ⚠️  Found {missing} missing values, filling with 0...")
-    X = X.fillna(0)
+    print(f"\n   ⚠️  Found {missing} missing values, filling with median...")
+    X = X.fillna(X.median())
 
 X = X.astype(np.float32)
 print(f"\n   Feature matrix: {X.shape}")
 
 # ============================================================
-# 3. 标准化
+# 3. 标准化 + PCA 降维
 # ============================================================
-print(f"\n【STEP 3】Feature Standardization")
+print(f"\n【STEP 3】Feature Standardization + PCA")
 print("=" * 80)
 
-scaler = StandardScaler()
+# 使用 RobustScaler 代替 StandardScaler (对异常值更鲁棒)
+scaler = RobustScaler()
 X_scaled = scaler.fit_transform(X)
 X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
-print(f"   ✓ Standardized: mean=0, std=1")
+print(f"   ✓ RobustScaler: median-centered, IQR-scaled")
 
 # 移除零方差特征
 var = X_scaled.var(axis=0)
@@ -106,63 +129,85 @@ active = var > 1e-8
 n_removed = (~active).sum()
 if n_removed > 0:
     print(f"   ⚠️  Removing {n_removed} zero-variance features")
-    X_cluster = X_scaled[:, active]
+    X_active = X_scaled[:, active]
     active_feature_cols = [feature_cols[i] for i in range(len(feature_cols)) if active[i]]
 else:
-    X_cluster = X_scaled
+    X_active = X_scaled
     active_feature_cols = feature_cols
 
-print(f"   ✓ Active features: {X_cluster.shape[1]}")
+print(f"   ✓ Active features: {X_active.shape[1]}")
+
+# PCA 降维 (保留 95% 方差，减少噪声维度)
+pca_reduction = PCA(n_components=0.95, random_state=CONFIG['seed'])
+X_cluster = pca_reduction.fit_transform(X_active)
+n_pca_dims = X_cluster.shape[1]
+pca_var_retained = pca_reduction.explained_variance_ratio_.sum()
+print(f"   ✓ PCA: {X_active.shape[1]} → {n_pca_dims} dims (variance retained: {pca_var_retained:.2%})")
 
 # ============================================================
-# 4. GMM 聚类 (K=4)
+# 4. 自动 K 选择 + GMM 聚类
 # ============================================================
-print(f"\n【STEP 4】GMM Clustering (K={CONFIG['n_clusters']})")
+print(f"\n【STEP 4】Automatic K Selection + GMM Clustering")
 print("=" * 80)
 
-K = CONFIG['n_clusters']
-best_labels = None
-best_score = -1
-best_cov_type = None
+k_range = CONFIG['k_range']
+k_results = {}
 
-print(f"\n   Testing covariance types...")
+print(f"\n   Testing K from {k_range.start} to {k_range.stop - 1}...")
+print(f"   {'K':<5} {'BIC':<12} {'Silhouette':<12} {'CH':<12} {'DB':<10}")
+print(f"   {'-'*50}")
 
-for cov_type in ['full', 'tied', 'diag', 'spherical']:
-    print(f"\n   Testing cov_type='{cov_type}'...", end=" ")
-    try:
-        gmm = GaussianMixture(
-            n_components=K, 
-            covariance_type=cov_type,
-            n_init=10,  # 更多初始化
-            random_state=CONFIG['seed'], 
-            max_iter=500,  # 更多迭代
-            reg_covar=1e-4,
-            verbose=0
-        )
-        gmm.fit(X_cluster)
-        labels = gmm.predict(X_cluster)
-        
-        # 计算评分
-        sil = silhouette_score(X_cluster, labels, 
-                              sample_size=min(5000, len(X_cluster)), 
-                              random_state=CONFIG['seed'])
-        ch = calinski_harabasz_score(X_cluster, labels)
-        db = davies_bouldin_score(X_cluster, labels)
-        
-        print(f"✓ Sil={sil:.4f}, CH={ch:.1f}, DB={db:.4f}")
-        
-        if sil > best_score:
-            best_score = sil
-            best_labels = labels
-            best_cov_type = cov_type
-            best_gmm = gmm
-            best_ch = ch
-            best_db = db
+for K in k_range:
+    best_sil_k = -1
+    best_result_k = None
     
-    except Exception as e:
-        print(f"✗ Failed: {str(e)[:50]}")
+    for cov_type in ['full', 'tied', 'diag']:
+        try:
+            gmm = GaussianMixture(
+                n_components=K, 
+                covariance_type=cov_type,
+                n_init=10,
+                random_state=CONFIG['seed'], 
+                max_iter=500,
+                reg_covar=1e-4,
+                verbose=0
+            )
+            gmm.fit(X_cluster)
+            labels = gmm.predict(X_cluster)
+            
+            sil = silhouette_score(X_cluster, labels, 
+                                  sample_size=min(5000, len(X_cluster)), 
+                                  random_state=CONFIG['seed'])
+            ch = calinski_harabasz_score(X_cluster, labels)
+            db = davies_bouldin_score(X_cluster, labels)
+            bic = gmm.bic(X_cluster)
+            
+            if sil > best_sil_k:
+                best_sil_k = sil
+                best_result_k = {
+                    'gmm': gmm, 'labels': labels, 'cov_type': cov_type,
+                    'sil': sil, 'ch': ch, 'db': db, 'bic': bic
+                }
+        except Exception:
+            pass
+    
+    if best_result_k is not None:
+        k_results[K] = best_result_k
+        r = best_result_k
+        print(f"   {K:<5} {r['bic']:<12.1f} {r['sil']:<12.4f} {r['ch']:<12.1f} {r['db']:<10.4f}")
 
-print(f"\n   🏆 Best: cov_type='{best_cov_type}' (Silhouette={best_score:.4f})")
+# 选择最优 K (基于 Silhouette)
+best_K = max(k_results, key=lambda k: k_results[k]['sil'])
+best_result = k_results[best_K]
+best_labels = best_result['labels']
+best_gmm = best_result['gmm']
+best_cov_type = best_result['cov_type']
+best_score = best_result['sil']
+best_ch = best_result['ch']
+best_db = best_result['db']
+K = best_K
+
+print(f"\n   🏆 Best: K={K}, cov_type='{best_cov_type}' (Silhouette={best_score:.4f})")
 
 # ============================================================
 # 5. 分析车辆聚类
@@ -180,12 +225,13 @@ for vc in unique_clusters:
     pct = n / len(best_labels) * 100
     print(f"      V{vc}: {n:>6,} vehicles ({pct:>5.1f}%)")
 
-    # 统计
-    X_vc = X[mask]
+    # 统计 - 使用原始 vehicle_features 数据进行分析
+    vf_vc = vehicle_features[mask]
     
-    comp_mean = X_vc[cluster_ratio_cols].mean()
-    high_energy = X_vc['high_energy_ratio'].mean()
-    idle_dominant = X_vc['idle_dominant_ratio'].mean()
+    comp_mean = vf_vc[cluster_ratio_cols].mean()
+    # 从 cluster ratios 计算 (避免依赖冗余特征列)
+    high_energy = comp_mean['cluster_2_ratio'] + comp_mean['cluster_3_ratio']
+    idle_dominant = comp_mean['cluster_0_ratio']
     
     v_stats[vc] = {
         'size': int(n),
@@ -254,7 +300,7 @@ ax.text(0.5, 0.3, 'Davies-Bouldin (↓)', ha='center', va='center',
 ax.set_xlim(0, 1); ax.set_ylim(0, 1)
 ax.axis('off')
 
-plt.suptitle(f'GMM Clustering (K=4, cov_type={best_cov_type})', 
+plt.suptitle(f'GMM Clustering (K={K}, cov_type={best_cov_type})', 
             fontweight='bold', fontsize=13)
 plt.tight_layout()
 
@@ -265,8 +311,8 @@ plt.close()
 print(f"   ✓ Saved: gmm_clustering_metrics.png/pdf")
 
 # 6.2 PCA 可视化
-pca = PCA(n_components=2, random_state=CONFIG['seed'])
-X_pca = pca.fit_transform(X_scaled)
+pca_viz = PCA(n_components=2, random_state=CONFIG['seed'])
+X_pca = pca_viz.fit_transform(X_active)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -280,7 +326,7 @@ for vi, vc in enumerate(unique_clusters):
                label=f'V{vc}: {label} (n={mask.sum()})',
                edgecolors='black', linewidth=0.5)
 
-ev = pca.explained_variance_ratio_
+ev = pca_viz.explained_variance_ratio_
 ax1.set_xlabel(f'PC1 ({ev[0]:.1%})', fontweight='bold', fontsize=11)
 ax1.set_ylabel(f'PC2 ({ev[1]:.1%})', fontweight='bold', fontsize=11)
 ax1.set_title('(a) Vehicle Clusters (PCA)', fontweight='bold', fontsize=12)
@@ -357,13 +403,23 @@ print(f"   ✓ vehicle_clustering_gmm_k4.csv ({len(vehicle_features):,} vehicles
 
 # 7.2 NPZ 格式
 np.savez(os.path.join(CONFIG['save_dir'], 'vehicle_clustering_gmm_k4.npz'),
-         X=X, X_scaled=X_scaled, best_labels=best_labels,
+         X=X.values, X_scaled=X_scaled, best_labels=best_labels,
          vehicle_ids=vehicle_features['vehicle_id'].values,
          X_pca=X_pca, feature_names=np.array(active_feature_cols),
          gmm_model=best_gmm)
 print(f"   ✓ vehicle_clustering_gmm_k4.npz")
 
 # 7.3 摘要
+k_selection_info = {}
+for k_val, r in k_results.items():
+    k_selection_info[str(k_val)] = {
+        'silhouette': float(r['sil']),
+        'calinski_harabasz': float(r['ch']),
+        'davies_bouldin': float(r['db']),
+        'bic': float(r['bic']),
+        'cov_type': r['cov_type'],
+    }
+
 summary = {
     'timestamp': pd.Timestamp.now().isoformat(),
     'method': 'GMM',
@@ -374,6 +430,9 @@ summary = {
     'davies_bouldin_score': float(best_db),
     'n_vehicles': len(vehicle_features),
     'n_features': len(active_feature_cols),
+    'pca_dims': int(n_pca_dims),
+    'pca_variance_retained': float(pca_var_retained),
+    'k_selection': k_selection_info,
     'cluster_stats': {str(k): v for k, v in v_stats.items()},
     'feature_names': active_feature_cols,
 }
@@ -393,9 +452,10 @@ print("=" * 80)
 print(f"""
 Summary:
   - Vehicles: {len(vehicle_features):,}
-  - Clusters: {K}
+  - Clusters: {K} (auto-selected from {CONFIG['k_range'].start}-{CONFIG['k_range'].stop - 1})
   - Method: GMM
   - Covariance Type: {best_cov_type}
+  - PCA Dims: {n_pca_dims} (variance: {pca_var_retained:.2%})
   - Silhouette Score: {best_score:.4f}
   - Calinski-Harabasz: {best_ch:.1f}
   - Davies-Bouldin: {best_db:.4f}
