@@ -63,18 +63,32 @@ print(f"   ✓ Segments: {len(segments_df):,} segments")
 print(f"\n【STEP 2】Preparing Clustering Features")
 print("=" * 80)
 
-# 选择用于聚类的特征
-cluster_ratio_cols = [f'cluster_{c}_ratio' for c in range(4)]
-behavior_cols = ['high_energy_ratio', 'idle_dominant_ratio']
-phys_cols = [c for c in vehicle_features.columns if c.startswith('avg_')]
+# 选择用于聚类的特征 — 三维特征框架
+N_MODES = 4  # 片段聚类数（模式数）
 
-feature_cols = cluster_ratio_cols + behavior_cols + phys_cols
+# ① Distribution (4): 四种模式各占多少比例
+dist_cols = [f'cluster_{c}_ratio' for c in range(N_MODES)]
 
-print(f"\n   Feature Selection:")
-print(f"      Cluster composition: {len(cluster_ratio_cols)} features")
-print(f"      Driving behavior: {len(behavior_cols)} features")
-print(f"      Physical features: {len(phys_cols)} features")
-print(f"      Total: {len(feature_cols)} features")
+# ② Transition (16+3): 模式之间如何转换
+trans_matrix_cols = [f'trans_{i}_to_{j}' for i in range(N_MODES) for j in range(N_MODES)]
+trans_aux_cols = ['transition_entropy', 'mode_switch_rate', 'self_loop_ratio']
+trans_cols = [c for c in trans_matrix_cols + trans_aux_cols if c in vehicle_features.columns]
+
+# ③ Evolution: 时序累积、节奏、稳定性
+evol_candidates = [
+    'state_entropy', 'soc_consumption_rate', 'max_soc_drop',
+    'avg_soc_drop_per_segment', 'max_consecutive_high_energy',
+    'count_consecutive_high_energy', 'avg_run_length', 'total_duration_hrs',
+] + [f'mode_{c}_avg_duration' for c in range(N_MODES)]
+evol_cols = [c for c in evol_candidates if c in vehicle_features.columns]
+
+feature_cols = dist_cols + trans_cols + evol_cols
+
+print(f"\n   Three-Dimension Feature Framework:")
+print(f"      ① Distribution:  {len(dist_cols)} features")
+print(f"      ② Transition:    {len(trans_cols)} features ({len([c for c in trans_matrix_cols if c in vehicle_features.columns])} matrix + {len([c for c in trans_aux_cols if c in vehicle_features.columns])} auxiliary)")
+print(f"      ③ Evolution:     {len(evol_cols)} features")
+print(f"      Total:           {len(feature_cols)} features")
 
 # 提取特征矩阵
 X = vehicle_features[feature_cols].copy()
@@ -183,15 +197,32 @@ for vc in unique_clusters:
     # 统计
     X_vc = X[mask]
     
-    comp_mean = X_vc[cluster_ratio_cols].mean()
-    high_energy = X_vc['high_energy_ratio'].mean()
-    idle_dominant = X_vc['idle_dominant_ratio'].mean()
+    # ① Distribution
+    comp_mean = X_vc[dist_cols].mean()
+    
+    # ② Transition (平均转移概率 + 辅助指标)
+    trans_mean = {}
+    for tc in trans_cols:
+        if tc in X_vc.columns:
+            trans_mean[tc] = float(X_vc[tc].mean())
+    
+    # ③ Evolution
+    evol_mean = {}
+    for ec in evol_cols:
+        if ec in X_vc.columns:
+            evol_mean[ec] = float(X_vc[ec].mean())
+    
+    # 兼容旧逻辑
+    high_energy = X_vc['high_energy_ratio'].mean() if 'high_energy_ratio' in X_vc.columns else 0.0
+    idle_dominant = X_vc['idle_dominant_ratio'].mean() if 'idle_dominant_ratio' in X_vc.columns else 0.0
     
     v_stats[vc] = {
         'size': int(n),
         'pct': float(pct),
         'composition': {f'C{c}': float(comp_mean[f'cluster_{c}_ratio']) 
                        for c in range(4)},
+        'transition': trans_mean,
+        'evolution': evol_mean,
         'high_energy_ratio': float(high_energy),
         'idle_dominant_ratio': float(idle_dominant),
     }
@@ -374,6 +405,11 @@ summary = {
     'davies_bouldin_score': float(best_db),
     'n_vehicles': len(vehicle_features),
     'n_features': len(active_feature_cols),
+    'feature_framework': {
+        'distribution': len(dist_cols),
+        'transition': len(trans_cols),
+        'evolution': len(evol_cols),
+    },
     'cluster_stats': {str(k): v for k, v in v_stats.items()},
     'feature_names': active_feature_cols,
 }

@@ -200,61 +200,175 @@ trip_agg_df = pd.DataFrame(trip_features)
 print(f"   ✓ Aggregated {len(trip_agg_df):,} trips")
 
 # ============================================================
-# 4. 聚合到车辆级
+# 4. 聚合到车辆级 — 三维特征框架
+#    ① Distribution (4)  ② Transition (16+)  ③ Evolution (~)
 # ============================================================
-print(f"\n【STEP 4】Aggregating to vehicle level...")
+print(f"\n【STEP 4】Aggregating to vehicle level (3-Dimension Framework)")
+
+from scipy.stats import entropy as scipy_entropy
+
+K = 4  # 片段聚类数
 
 vehicle_features = []
 
 for vehicle_id, v_group in tqdm(seg_df_final.groupby('vehicle_id'),
                                 desc="   🔄 Vehicle aggregation", ncols=80):
-    n_segs = len(v_group)
-    n_trips = v_group['trip_id'].nunique()
-    
-    # 基本信息
+    v_sorted = v_group.sort_values('start_dt')
+    n_segs = len(v_sorted)
+    n_trips = v_sorted['trip_id'].nunique()
+    clusters = v_sorted['cluster_id'].astype(int).values
+
     feat = {
         'vehicle_id': vehicle_id,
         'n_segments': n_segs,
         'n_trips': n_trips,
     }
-    
-    # 聚类组成（占比）
-    cluster_dist = v_group['cluster_id'].value_counts(normalize=True).to_dict()
-    for c in range(4):
+
+    # =============================================
+    # ① Distribution Features (4 维)
+    # =============================================
+    cluster_dist = v_sorted['cluster_id'].value_counts(normalize=True).to_dict()
+    for c in range(K):
         feat[f'cluster_{c}_ratio'] = cluster_dist.get(c, 0.0)
-    
-    # 转移矩阵（简化版：只看占比）
-    clusters = v_group['cluster_id'].values
-    if len(clusters) > 1:
-        transitions = {}
-        for i in range(len(clusters) - 1):
-            from_c = clusters[i]
-            to_c = clusters[i + 1]
-            key = f'trans_{from_c}_to_{to_c}'
-            transitions[key] = transitions.get(key, 0) + 1
-        
-        for key, count in transitions.items():
-            feat[key] = count / (len(clusters) - 1)
-    
-    # 驾驶行为指标
-    feat['high_energy_ratio'] = (v_group['cluster_id'].isin([2, 3])).sum() / n_segs  # Highway + Mixed
-    feat['idle_dominant_ratio'] = (v_group['cluster_id'] == 0).sum() / n_segs  # Long Idle
-    
-    # 物理特征均值
+
+    # =============================================
+    # ② Transition Dynamics (K×K=16 + 辅助指标)
+    # =============================================
+    T = np.zeros((K, K))
+    if n_segs > 1:
+        for t in range(n_segs - 1):
+            T[clusters[t], clusters[t + 1]] += 1
+        # 行归一化 → 转移概率矩阵
+        row_sums = T.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        T_prob = T / row_sums
+    else:
+        T_prob = np.zeros((K, K))
+
+    # flatten 为 16 个特征
+    for i in range(K):
+        for j in range(K):
+            feat[f'trans_{i}_to_{j}'] = float(T_prob[i, j])
+
+    # 转移熵 (transition entropy): 越低越规律
+    if n_segs > 1:
+        trans_entropies = []
+        for i in range(K):
+            row = T_prob[i]
+            if row.sum() > 0:
+                trans_entropies.append(scipy_entropy(row + 1e-12))
+        feat['transition_entropy'] = float(np.mean(trans_entropies)) if trans_entropies else 0.0
+    else:
+        feat['transition_entropy'] = 0.0
+
+    # 模式切换率
+    if n_segs > 1:
+        switches = sum(1 for t in range(n_segs - 1) if clusters[t] != clusters[t + 1])
+        feat['mode_switch_rate'] = switches / (n_segs - 1)
+    else:
+        feat['mode_switch_rate'] = 0.0
+
+    # 自循环比率
+    if n_segs > 1:
+        self_loops = sum(1 for t in range(n_segs - 1) if clusters[t] == clusters[t + 1])
+        feat['self_loop_ratio'] = self_loops / (n_segs - 1)
+    else:
+        feat['self_loop_ratio'] = 0.0
+
+    # =============================================
+    # ③ Evolution / Rhythm / Stability Features
+    # =============================================
+    # --- 状态熵 (state entropy): 模式多样性 ---
+    p_dist = np.array([cluster_dist.get(c, 0.0) for c in range(K)])
+    feat['state_entropy'] = float(scipy_entropy(p_dist + 1e-12))
+
+    # --- 能量累积 (Energy accumulation) ---
+    soc_drops = v_sorted['soc_start'].values - v_sorted['soc_end'].values
+    durations_min = v_sorted['duration_seconds'].values / 60.0
+    total_duration_min = durations_min.sum()
+
+    # SOC 消耗速率 (%/min)
+    feat['soc_consumption_rate'] = float(soc_drops.sum() / total_duration_min) if total_duration_min > 0 else 0.0
+    # 最大 SOC drop（极端能耗事件）
+    feat['max_soc_drop'] = float(soc_drops.max()) if len(soc_drops) > 0 else 0.0
+    feat['avg_soc_drop_per_segment'] = float(soc_drops.mean()) if len(soc_drops) > 0 else 0.0
+    feat['total_duration_hrs'] = float(total_duration_min / 60.0)
+
+    # 连续高能耗段（cluster 2 & 3）最长长度和次数
+    high_energy_mask = np.isin(clusters, [2, 3])
+    max_consecutive_high = 0
+    count_consecutive_high = 0
+    current_run = 0
+    for flag in high_energy_mask:
+        if flag:
+            current_run += 1
+        else:
+            if current_run > 0:
+                max_consecutive_high = max(max_consecutive_high, current_run)
+                count_consecutive_high += 1
+            current_run = 0
+    if current_run > 0:
+        max_consecutive_high = max(max_consecutive_high, current_run)
+        count_consecutive_high += 1
+    feat['max_consecutive_high_energy'] = max_consecutive_high
+    feat['count_consecutive_high_energy'] = count_consecutive_high
+
+    # --- 节奏 (Temporal rhythm) ---
+    # 各模式平均持续时间（秒）
+    for c in range(K):
+        mode_mask = clusters == c
+        mode_durations = v_sorted['duration_seconds'].values[mode_mask]
+        feat[f'mode_{c}_avg_duration'] = float(mode_durations.mean()) if len(mode_durations) > 0 else 0.0
+
+    # 平均 run length（连续相同模式的平均长度）
+    if n_segs > 0:
+        run_lengths = []
+        current_run = 1
+        for t in range(1, n_segs):
+            if clusters[t] == clusters[t - 1]:
+                current_run += 1
+            else:
+                run_lengths.append(current_run)
+                current_run = 1
+        run_lengths.append(current_run)
+        feat['avg_run_length'] = float(np.mean(run_lengths))
+    else:
+        feat['avg_run_length'] = 0.0
+
+    # --- 驾驶行为指标（保留兼容） ---
+    feat['high_energy_ratio'] = (v_sorted['cluster_id'].isin([2, 3])).sum() / n_segs
+    feat['idle_dominant_ratio'] = (v_sorted['cluster_id'] == 0).sum() / n_segs
+
+    # --- 物理特征均值 ---
     for pk in phys_keys:
         col = f'phys_{pk}'
-        if col in v_group.columns:
-            feat[f'avg_{pk}'] = v_group[col].mean()
-    
-    # SOC 和能耗
-    soc_drops = v_group['soc_start'].values - v_group['soc_end'].values
-    feat['avg_soc_drop_per_segment'] = soc_drops.mean()
-    feat['total_duration_hrs'] = v_group['duration_seconds'].sum() / 3600.0
-    
+        if col in v_sorted.columns:
+            feat[f'avg_{pk}'] = v_sorted[col].mean()
+
     vehicle_features.append(feat)
 
 vehicle_agg_df = pd.DataFrame(vehicle_features)
+
+# 确保所有转移矩阵列存在（填充为 0）
+for i in range(K):
+    for j in range(K):
+        col = f'trans_{i}_to_{j}'
+        if col not in vehicle_agg_df.columns:
+            vehicle_agg_df[col] = 0.0
+vehicle_agg_df = vehicle_agg_df.fillna(0.0)
+
 print(f"   ✓ Aggregated {len(vehicle_agg_df):,} vehicles")
+print(f"   Feature dimensions:")
+dist_cols = [f'cluster_{c}_ratio' for c in range(K)]
+trans_cols = [f'trans_{i}_to_{j}' for i in range(K) for j in range(K)]
+evol_cols = ['transition_entropy', 'mode_switch_rate', 'self_loop_ratio',
+             'state_entropy', 'soc_consumption_rate', 'max_soc_drop',
+             'avg_soc_drop_per_segment', 'max_consecutive_high_energy',
+             'count_consecutive_high_energy', 'avg_run_length',
+             'total_duration_hrs'] + [f'mode_{c}_avg_duration' for c in range(K)]
+print(f"      ① Distribution: {len(dist_cols)} features")
+print(f"      ② Transition:   {len(trans_cols)} features (+3 auxiliary)")
+print(f"      ③ Evolution:    {len(evol_cols)} features")
 
 # ============================================================
 # 5. 与现有行程数据对齐
@@ -329,7 +443,17 @@ metadata = {
         'trip_gap_threshold_minutes': TRIP_GAP_MINUTES,
         'segment_source': 'clustering_v3/clustering_v3_results.npz',
         'physical_features': phys_keys,
-    }
+    },
+    'vehicle_feature_framework': {
+        'distribution_features': [f'cluster_{c}_ratio' for c in range(K)],
+        'transition_features': [f'trans_{i}_to_{j}' for i in range(K) for j in range(K)]
+                                + ['transition_entropy', 'mode_switch_rate', 'self_loop_ratio'],
+        'evolution_features': ['state_entropy', 'soc_consumption_rate', 'max_soc_drop',
+                               'avg_soc_drop_per_segment', 'max_consecutive_high_energy',
+                               'count_consecutive_high_energy', 'avg_run_length',
+                               'total_duration_hrs']
+                              + [f'mode_{c}_avg_duration' for c in range(K)],
+    },
 }
 
 metadata_path = os.path.join(output_dir, 'integration_metadata.json')
@@ -385,15 +509,15 @@ Generated Files:
      - soc_drop, duration
      
   3. vehicles_aggregated_features.csv      ({len(vehicle_agg_df):,} rows)
-     - vehicle_id
-     - cluster_0_ratio ~ cluster_3_ratio
-     - Driving behavior indices
+     - ① Distribution: cluster_0_ratio ~ cluster_3_ratio  (4 features)
+     - ② Transition:   trans_i_to_j (16) + entropy/switch_rate/self_loop (3)
+     - ③ Evolution:    energy, rhythm, stability metrics ({len(evol_cols)} features)
      
   4. inter_charge_trips_with_clusters.csv
      - Original trips + cluster features
 
 Next Steps:
   1. Use vehicles_aggregated_features.csv for vehicle clustering
-  2. Run: python vehicle_clustering/step8_vehicle_clustering_fixed.py
-  3. Update the config to use segments_integrated_complete.csv
+  2. Run: python vehicle_clustering/step8_vehicle_clustering.py
+  3. Run: python coupling_analysis/step_3_3_coupling_analysis.py
 """)

@@ -17,6 +17,7 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
 import shap
 from tqdm import tqdm
+import seaborn as sns
 
 warnings.filterwarnings('ignore')
 
@@ -414,9 +415,163 @@ plt.close()
 print(f"   ✓ Saved: fig_shap_summary.png/pdf")
 
 # ============================================================
-# 10. 关键发现
+# 10. 按车辆类型分层分析 (Per-Vehicle-Type Stratified Analysis)
 # ============================================================
-print(f"\n【STEP 10】Key Findings")
+print(f"\n【STEP 10】Per-Vehicle-Type Stratified Analysis")
+print("=" * 80)
+
+target_col = 'charge_trigger_soc'
+
+# 获取车辆类型列表
+vehicle_types = sorted(df_model['vehicle_cluster'].dropna().unique())
+print(f"   Vehicle types found: {len(vehicle_types)}")
+
+per_type_results = {}
+
+for vtype in vehicle_types:
+    vtype_str = str(vtype)
+    vtype_name = VEHICLE_NAMES.get(int(vtype) if str(vtype).isdigit() else vtype,
+                                   f'Type {vtype}')
+    mask = df_model['vehicle_cluster'].astype(str) == vtype_str
+    df_type = df_model[mask]
+
+    if len(df_type) < 50:
+        print(f"\n   ⚠️ {vtype_name}: only {len(df_type)} samples, skipping")
+        continue
+
+    print(f"\n   ─── {vtype_name} (n={len(df_type):,}) ───")
+
+    X_type = df_type[feature_cols].copy()
+    y_type = df_type[target_col].copy()
+
+    # 编码车辆聚类（对分层模型无差异，但保持一致性）
+    le_type = LabelEncoder()
+    X_type_enc = X_type.copy()
+    X_type_enc['vehicle_cluster'] = le_type.fit_transform(df_type['vehicle_cluster'].astype(str))
+
+    scaler_type = StandardScaler()
+    X_type_scaled = scaler_type.fit_transform(X_type_enc)
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_type_scaled, y_type, test_size=0.2, random_state=CONFIG['seed']
+    )
+
+    model_type = XGBRegressor(
+        n_estimators=150,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=CONFIG['seed'],
+        n_jobs=-1,
+        verbosity=0,
+    )
+    model_type.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+
+    y_pred_type = model_type.predict(X_te)
+    r2_type = r2_score(y_te, y_pred_type)
+    mae_type = mean_absolute_error(y_te, y_pred_type)
+    rmse_type = np.sqrt(mean_squared_error(y_te, y_pred_type))
+
+    print(f"      R²={r2_type:.4f}  MAE={mae_type:.4f}  RMSE={rmse_type:.4f}")
+
+    # Feature importance
+    feat_cols_type = list(feature_cols) + ['vehicle_cluster']
+    fi_type = pd.DataFrame({
+        'feature': feat_cols_type,
+        'importance': model_type.feature_importances_,
+    }).sort_values('importance', ascending=False)
+
+    top3 = fi_type.head(3)
+    print(f"      Top-3 features: {', '.join(top3['feature'].values)}")
+
+    # SHAP for this type
+    explainer_type = shap.TreeExplainer(model_type)
+    shap_vals_type = explainer_type.shap_values(X_te)
+
+    # Save SHAP figure for this type
+    fig_type, ax_type = plt.subplots(figsize=(10, 6))
+    shap.summary_plot(shap_vals_type, X_te,
+                      feature_names=feat_cols_type,
+                      plot_type='bar', show=False)
+    plt.title(f'SHAP — {vtype_name} (n={len(df_type):,})',
+              fontweight='bold', fontsize=12)
+    plt.tight_layout()
+    for fmt, dpi in [('.png', 300), ('.pdf', None)]:
+        path = os.path.join(CONFIG['figure_dir'],
+                            f'fig_shap_vehicle_type_{vtype_str}{fmt}')
+        fig_type.savefig(path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+
+    per_type_results[vtype_str] = {
+        'name': vtype_name,
+        'n_samples': int(len(df_type)),
+        'r2': float(r2_type),
+        'mae': float(mae_type),
+        'rmse': float(rmse_type),
+        'top_features': fi_type.head(5).to_dict('records'),
+    }
+
+print(f"\n   ✓ Saved per-type SHAP figures")
+
+# ============================================================
+# 10b. 跨类型对比可视化
+# ============================================================
+if len(per_type_results) >= 2:
+    print(f"\n   Generating cross-type comparison...")
+
+    fig_cmp, axes_cmp = plt.subplots(1, 2, figsize=(14, 6))
+
+    # (a) R² 对比
+    ax = axes_cmp[0]
+    type_names = [per_type_results[k]['name'] for k in sorted(per_type_results)]
+    r2_vals = [per_type_results[k]['r2'] for k in sorted(per_type_results)]
+    bars = ax.bar(range(len(type_names)), r2_vals,
+                  color=['#5B9BD5', '#70AD47', '#C0504D', '#FFC000'][:len(type_names)],
+                  edgecolor='black', linewidth=1.5)
+    for bar, val in zip(bars, r2_vals):
+        ax.text(bar.get_x() + bar.get_width() / 2, val + 0.01,
+                f'{val:.3f}', ha='center', fontweight='bold', fontsize=10)
+    ax.set_xticks(range(len(type_names)))
+    ax.set_xticklabels(type_names, rotation=20, ha='right', fontsize=9)
+    ax.set_ylabel('R² Score', fontweight='bold')
+    ax.set_title('(a) Model R² by Vehicle Type', fontweight='bold', fontsize=12)
+    ax.grid(True, alpha=0.2, axis='y')
+
+    # (b) Top feature 对比热力图
+    ax = axes_cmp[1]
+    all_feats = list(set(
+        f for k in per_type_results
+        for f in [x['feature'] for x in per_type_results[k]['top_features'][:3]]
+    ))
+    heat_data = np.zeros((len(per_type_results), len(all_feats)))
+    sorted_keys = sorted(per_type_results)
+    for ri, k in enumerate(sorted_keys):
+        fi_map = {x['feature']: x['importance'] for x in per_type_results[k]['top_features']}
+        for ci, f in enumerate(all_feats):
+            heat_data[ri, ci] = fi_map.get(f, 0.0)
+
+    sns.heatmap(heat_data, annot=True, fmt='.3f', cmap='YlOrRd',
+                xticklabels=all_feats, ax=ax,
+                yticklabels=[per_type_results[k]['name'] for k in sorted_keys])
+    ax.set_title('(b) Feature Importance Comparison', fontweight='bold', fontsize=12)
+    ax.tick_params(axis='x', rotation=45)
+
+    plt.suptitle('Cross-Vehicle-Type Coupling Comparison',
+                 fontweight='bold', fontsize=13)
+    plt.tight_layout()
+
+    for fmt, dpi in [('.png', 300), ('.pdf', None)]:
+        path = os.path.join(CONFIG['figure_dir'],
+                            f'fig_cross_type_comparison{fmt}')
+        fig_cmp.savefig(path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+    print(f"   ✓ Saved: fig_cross_type_comparison.png/pdf")
+
+# ============================================================
+# 11. 关键发现
+# ============================================================
+print(f"\n【STEP 11】Key Findings")
 print("=" * 80)
 
 print(f"""
@@ -432,27 +587,36 @@ else:
     print(f"   激进驾驶的影响较弱")
 
 print(f"""
-【发现 2】模型性能
+【发现 2】模型性能（全局）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    R² Score: {r2:.4f}
    MAE: {mae:.4f}%
    Top feature: {feature_importance.iloc[0]['feature']}
 """)
 
+if per_type_results:
+    print(f"""
+【发现 3】分车辆类型模型性能对比
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
+    for k in sorted(per_type_results):
+        res = per_type_results[k]
+        print(f"   {res['name']:<35} R²={res['r2']:.4f}  MAE={res['mae']:.4f}  (n={res['n_samples']:,})")
+
 # ============================================================
-# 11. 保存结果
+# 12. 保存结果
 # ============================================================
-print(f"\n【STEP 11】Saving Results")
+print(f"\n【STEP 12】Saving Results")
 print("=" * 80)
 
 results = {
-    'model_performance': {
+    'overall_model_performance': {
         'r2_score': float(r2),
         'mae': float(mae),
         'rmse': float(rmse),
     },
     'feature_importance': feature_importance.to_dict('records'),
     'feature_correlations': {str(k): float(v) for k, v in correlation.items()},
+    'per_vehicle_type': per_type_results,
 }
 
 results_path = os.path.join(CONFIG['save_dir'], 'coupling_model_results.json')
@@ -469,12 +633,12 @@ Cache Info:
    Cache directory: {CONFIG['cache_dir']}
    Files cached: {len([f for f in CACHE_FILES.values() if os.path.exists(f)])}/{len(CACHE_FILES)}
    
-Next run will load from cache (much faster!)
-   
-Model Results:
+Overall Model Results:
    R² = {r2:.4f}
    MAE = {mae:.4f}%
    Top feature: {feature_importance.iloc[0]['feature']}
+   
+Per-Vehicle-Type Results: {len(per_type_results)} types analyzed
 """)
 
 print("=" * 80)
